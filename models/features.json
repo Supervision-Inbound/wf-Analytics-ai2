@@ -1,0 +1,18 @@
+{
+  "features": [
+    "hour_sin",
+    "hour_cos",
+    "dow",
+    "month",
+    "is_weekend",
+    "Temp_prom_nac",
+    "Lluvia_total_nac",
+    "Viento_prom_nac",
+    "lluvia_sum_6h",
+    "viento_max_6h",
+    "temp_mean_6h",
+    "llamadas_lag1",
+    "llamadas_lag24",
+    "llamadas_rolling_mean_3h"
+  ]
+}
