@@ -1,0 +1,50 @@
+name: generar-alertas
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 03:00 Santiago todos los días
+    - cron: "0 6 * * *"   # UTC≈03:00 America/Santiago (ajústalo si cambia DST)
+
+jobs:
+  inferir:
+    runs-on: ubuntu-latest
+    env:
+      # ← CAMBIA AQUÍ a la URL real que entrega clima por comuna (7 días)
+      CLIMA_FUTURO_URL: "https://turnos-api-inbound.andres-eliecergonzalez.workers.dev/clima"
+
+      # Sensibilidad de alerta (ajústalas si quieres)
+      MIN_REL_INCREASE: "0.10"   # 10% extra
+      MIN_ABS_INCREASE: "10"     # +10 llamadas
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy scikit-learn lightgbm joblib requests pytz
+
+      - name: Ejecutar inferencia de alertas
+        run: |
+          python scripts/inferencia_alertas.py \
+            --clima-url "${{ env.CLIMA_FUTURO_URL }}" \
+            --min-rel "${{ env.MIN_REL_INCREASE }}" \
+            --min-abs "${{ env.MIN_ABS_INCREASE }}" \
+            --modelo "models/modelo_trafico_clima_lgbm_llamadas.pkl" \
+            --features "models/features.json" \
+            --out "public/alertas.json"
+
+      - name: Commit & push alertas.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/alertas.json
+          git commit -m "chore: actualizar alertas.json [skip ci]" || echo "No changes"
+          git push
