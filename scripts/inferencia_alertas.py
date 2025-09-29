@@ -12,46 +12,45 @@ import pandas as pd
 import requests
 
 # =========================
-# CONFIG AJUSTABLE
+# CONFIG AJUSTABLE (por env o editando aquí)
 # =========================
 CLIMA_URL = os.getenv(
     "CLIMA_URL",
     "https://turnos-api-inbound.andres-eliecergonzalez.workers.dev/clima"
 )
 
-# Donde escribir las alertas
+# Salida
 OUT_PATH = "public/alertas.json"
 
-# Archivo con el baseline horario
-SEMILLA_PATH = "data/semilla_llamadas.json"
+# Insumos locales
+SEMILLA_PATH            = "data/semilla_llamadas.json"   # baseline por (dow-hora)
+COMUNAS_MAPPING_PATH    = "data/comunas_mapping.json"    # opcional
+SENSIBILIDAD_PATH       = "data/sensibilidad_comunas.json"  # opcional
 
-# Mapeo opcional de nombres de comuna (para corregir tildes/variantes)
-COMUNAS_MAPPING_PATH = "data/comunas_mapping.json"  # opcional
+# Parámetros de severidad y ponderación (realismo)
+RAIN_MM_MIN = float(os.getenv("RAIN_MM_MIN", "5.0"))     # mm a partir de donde "pega"
+RAIN_MM_MAX = float(os.getenv("RAIN_MM_MAX", "30.0"))    # mm donde severidad ≈ 1
+WIND_KMH_MIN = float(os.getenv("WIND_KMH_MIN", "35.0"))  # km/h a partir de donde "pega"
+WIND_KMH_MAX = float(os.getenv("WIND_KMH_MAX", "60.0"))  # km/h donde severidad ≈ 1
 
-# Sensibilidad por comuna (opcional). Si no tienes, se usa sensibilidad media (1.0)
-SENSIBILIDAD_PATH = "data/sensibilidad_comunas.json"
+# Intensidad base del efecto meteo (fracción máx. sobre expected_calls)
+# factor_modelo = 1 + K_BASE * severidad (antes de sensibilidad/alpha)
+K_BASE = float(os.getenv("K_BASE", "0.30"))               # 30% de techo con severidad=1
 
-# Parámetros de severidad y ponderación
-RAIN_MM_MIN = 5.0     # desde este umbral empieza a “pegar” la lluvia
-RAIN_MM_MAX = 30.0    # a partir de aquí consideramos severidad lluvia≈1
-WIND_KMH_MIN = 35.0   # desde aquí viento empieza a “pegar”
-WIND_KMH_MAX = 60.0   # a partir de aquí severidad viento≈1
+# Sensibilidad y filtros de alertas
+ALPHA_SUAVIZADO  = float(os.getenv("ALPHA_SUAVIZADO", "0.75"))
+UMBRAL_FACTOR    = float(os.getenv("UMBRAL_FACTOR", "1.10"))  # 10%+
+UMBRAL_MIN_CALLS = int(os.getenv("UMBRAL_MIN_CALLS", "8"))    # mín. llamadas extra
+CONFIDENCE_MIN   = float(os.getenv("CONFIDENCE_MIN", "0.35")) # descartar baja confianza
 
-K_BASE = 0.25         # impacto máximo (25%) cuando severidad=1 y sensibilidad=1
-
-# Filtro para no alertar ruido
-MIN_EXTRA_ABS = 5                  # mínimo de extra_calls en números absolutos
-MIN_EXTRA_REL = 0.08               # o 8% del baseline, lo que sea mayor
-CONFIDENCE_MIN = 0.35              # descartar alertas de muy baja confianza
-
-TZ = "America/Santiago"            # para ventana futura 7 días
+# Huso (solo para recortar ventana hoy→+7d)
+# *Aproximación* (UTC-3 o UTC-4 según DST; nos basta para cortar días futuros)
+TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "3"))  # 3 ~ America/Santiago invierno
 # =========================
 
 
-# -------------------------
-# Utilidades
-# -------------------------
-def load_json_if_exists(path, default=None):
+# ---------- Utils de carga ----------
+def load_json(path, default=None):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -62,187 +61,215 @@ def load_json_if_exists(path, default=None):
 
 
 def normalize_name(s: str) -> str:
-    """Normaliza nombre de comuna: minúsculas, sin dobles espacios, recorta."""
     if not s:
         return s
     s2 = str(s).strip().lower()
     s2 = " ".join(s2.split())
-    # puedes meter normalizaciones rápidas aquí si quieres
     return s2
 
 
-def now_scl():
-    # Runner está en UTC; calculamos ventana desde SCL por simplicidad (aprox)
-    # 03:00 SCL ~ 06:00 UTC; aquí solo nos interesa "hoy-->+7 días"
-    return dt.datetime.utcnow() - dt.timedelta(hours=3)
-
-
-def combine_severity(rain_sev: float, wind_sev: float) -> float:
-    """
-    Combina dos severidades (0..1) sin doble contabilidad.
-    Usamos 1 - (1-rain)*(1-wind) ≈ unión probabilística.
-    """
-    rain_sev = max(0.0, min(1.0, rain_sev))
-    wind_sev = max(0.0, min(1.0, wind_sev))
-    return 1.0 - (1.0 - rain_sev) * (1.0 - wind_sev)
-
-
-def severity_rain(precip_mm: float, precip_prob: float) -> float:
-    """
-    Severidad lluvia continua con probabilidad:
-    - mm por encima de RAIN_MM_MIN sube lineal hasta RAIN_MM_MAX
-    - multiplicamos por probabilidad (0..1)
-    """
-    if precip_mm is None:
-        return 0.0
-    mm = max(0.0, precip_mm - RAIN_MM_MIN) / max(1e-6, (RAIN_MM_MAX - RAIN_MM_MIN))
-    mm = max(0.0, min(1.0, mm))
-    p = max(0.0, min(1.0, (precip_prob or 0.0) / 100.0))
-    return mm * p
-
-
-def severity_wind(wind_kmh: float) -> float:
-    """Severidad viento continua (0..1) entre WIND_KMH_MIN y WIND_KMH_MAX."""
-    if wind_kmh is None:
-        return 0.0
-    sev = (wind_kmh - WIND_KMH_MIN) / max(1e-6, (WIND_KMH_MAX - WIND_KMH_MIN))
-    return max(0.0, min(1.0, sev))
-
-
-def confidence_from(rain_sev: float, wind_sev: float, precip_prob: float) -> float:
-    """
-    Confianza simple: mezcla de severidades y probabilidad de precipitación.
-    """
-    p = max(0.0, min(1.0, (precip_prob or 0.0)/100.0))
-    sev = combine_severity(rain_sev, wind_sev)
-    return 0.5 * sev + 0.5 * p
-
-
-def expected_from_seed(seed: dict, when: dt.datetime) -> float:
-    """
-    Calcula expected_calls desde la semilla.
-    Admite:
-      - {"hourly": [24 valores], "weekend_boost": 1.10, "weekday_boost": 1.0}
-      - {"weekday": {0..6: [24 valores]}}
-      - {"by_hour": [24]} (fallback)
-    """
-    h = when.hour
-    dow = when.weekday()
-
-    if "weekday" in seed and isinstance(seed["weekday"], dict):
-        row = seed["weekday"].get(str(dow)) or seed["weekday"].get(dow)
-        if isinstance(row, (list, tuple)) and len(row) == 24:
-            return float(row[h])
-
-    if "hourly" in seed and isinstance(seed["hourly"], list) and len(seed["hourly"]) == 24:
-        base = float(seed["hourly"][h])
-        # boosts
-        if dow >= 5:
-            base *= float(seed.get("weekend_boost", 1.0))
-        else:
-            base *= float(seed.get("weekday_boost", 1.0))
-        return base
-
-    if "by_hour" in seed and isinstance(seed["by_hour"], list) and len(seed["by_hour"]) == 24:
-        return float(seed["by_hour"][h])
-
-    # fallback muy básico
-    return 100.0
-
-
 def build_equivalences(mapping: dict) -> dict:
-    """
-    Construye un diccionario de equivalencias normalizadas.
-    mapping puede traer { "pto montt": "puerto montt", ... }.
-    """
     eq = {}
     for k, v in (mapping or {}).items():
         eq[normalize_name(k)] = normalize_name(v)
     return eq
 
 
-def main():
-    # ---------- Carga insumos ----------
-    seed = load_json_if_exists(SEMILLA_PATH, default={"hourly": [100]*24})
-    sensibilidad = load_json_if_exists(SENSIBILIDAD_PATH, default={})  # {comuna_norm: 0.6..1.4}
-    mapping_raw = load_json_if_exists(COMUNAS_MAPPING_PATH, default={})
-    mapping = build_equivalences(mapping_raw)
+def now_scl():
+    # Runner está en UTC; aproximamos SCL restando TZ_OFFSET_HOURS
+    return dt.datetime.utcnow() - dt.timedelta(hours=TZ_OFFSET_HOURS)
 
-    # Sensibilidad default (media)
-    def sens_for(comuna_norm: str) -> float:
-        return float(sensibilidad.get(comuna_norm, 1.0))
 
-    # ---------- Descarga clima ----------
-    r = requests.get(CLIMA_URL, timeout=60)
+# ---------- Baseline (semilla) ----------
+def load_seed():
+    """
+    Acepta estructuras:
+      1) {"baseline_by_dow_hour": {"0-0": x, "0-1": y, ...}, "global_mean": m}
+      2) {"weekday": {"0":[24],..., "6":[24]}, "global_mean": m}
+      3) {"hourly":[24], "weekday_boost":1.0, "weekend_boost":1.05}
+      4) Fallback: global_mean=100
+    """
+    seed = load_json(SEMILLA_PATH, default={})
+    # Normaliza a dict "baseline_by_dow_hour"
+    if "baseline_by_dow_hour" in seed and isinstance(seed["baseline_by_dow_hour"], dict):
+        base = {str(k): float(v) for k, v in seed["baseline_by_dow_hour"].items()}
+        gm = float(seed.get("global_mean", 100.0))
+        return base, gm
+
+    if "weekday" in seed and isinstance(seed["weekday"], dict):
+        base = {}
+        for k, arr in seed["weekday"].items():
+            if isinstance(arr, list) and len(arr) == 24:
+                for h in range(24):
+                    base[f"{k}-{h}"] = float(arr[h])
+        gm = float(seed.get("global_mean", np.mean(list(base.values())) if base else 100.0))
+        return base, gm
+
+    if "hourly" in seed and isinstance(seed["hourly"], list) and len(seed["hourly"]) == 24:
+        wb = float(seed.get("weekday_boost", 1.0))
+        we = float(seed.get("weekend_boost", 1.0))
+        base = {}
+        for dow in range(7):
+            boost = we if dow >= 5 else wb
+            for h in range(24):
+                base[f"{dow}-{h}"] = float(seed["hourly"][h]) * boost
+        gm = float(seed.get("global_mean", np.mean(seed["hourly"])))
+        return base, gm
+
+    # Fallback llano
+    base = {f"{dow}-{h}": 100.0 for dow in range(7) for h in range(24)}
+    return base, 100.0
+
+
+def expected_from_seed(baseline_by_dow_hour: dict, global_mean: float, when: dt.datetime) -> float:
+    key = f"{when.weekday()}-{when.hour}"
+    return float(baseline_by_dow_hour.get(key, global_mean))
+
+
+# ---------- Severidades y confianza ----------
+def severity_rain(precip_mm: float, precip_prob: float) -> float:
+    if precip_mm is None:
+        return 0.0
+    # escala lineal entre RAIN_MM_MIN y RAIN_MM_MAX
+    mm = max(0.0, (precip_mm - RAIN_MM_MIN)) / max(1e-6, (RAIN_MM_MAX - RAIN_MM_MIN))
+    mm = max(0.0, min(1.0, mm))
+    p = max(0.0, min(1.0, (precip_prob or 0.0) / 100.0))
+    return mm * p
+
+
+def severity_wind(wind_kmh: float) -> float:
+    if wind_kmh is None:
+        return 0.0
+    sev = (wind_kmh - WIND_KMH_MIN) / max(1e-6, (WIND_KMH_MAX - WIND_KMH_MIN))
+    return max(0.0, min(1.0, sev))
+
+
+def combine_severity(rain_sev: float, wind_sev: float) -> float:
+    # Unión probabilística para no “doble-contar”
+    return 1.0 - (1.0 - max(0, min(1, rain_sev))) * (1.0 - max(0, min(1, wind_sev)))
+
+
+def confidence_from(rain_sev: float, wind_sev: float, precip_prob: float) -> float:
+    p = max(0.0, min(1.0, (precip_prob or 0.0) / 100.0))
+    sev = combine_severity(rain_sev, wind_sev)
+    return 0.5 * sev + 0.5 * p
+
+
+# ---------- Sensibilidad ----------
+def load_sensitivity():
+    sens = load_json(SENSIBILIDAD_PATH, default={})
+    # acepta claves "puerto montt" o "Puerto Montt"; normalizamos consulta
+    return {normalize_name(k): float(v) for k, v in sens.items()}
+
+
+def adjust_factor(factor_model: float, comuna_norm: str, sens_map: dict) -> float:
+    override = float(sens_map.get(comuna_norm, 1.0))
+    # suaviza picos y aplica override por comuna
+    return (factor_model ** ALPHA_SUAVIZADO) * override
+
+
+# ---------- Fetch y parsing de clima ----------
+def fetch_clima(url: str):
+    r = requests.get(url, timeout=60)
     r.raise_for_status()
-    clima = r.json()
+    data = r.json()
+    # Soportar dos formas:
+    # a) { ok: true, rows: [ {...}, {...} ] }
+    # b) [ {...}, {...} ]
+    if isinstance(data, dict) and "rows" in data:
+        rows = data["rows"]
+    elif isinstance(data, list):
+        rows = data
+    else:
+        raise RuntimeError("Estructura de clima no reconocida.")
 
-    # Estructura esperada (por comuna):
-    # {
-    #   "comuna": "Puerto Montt",
-    #   "lat": -41.45,
-    #   "lon": -72.93,
-    #   "hourly": { "time": [...], "wind_speed_10m": [...], "precipitation": [...], "precipitation_probability": [...] }
-    # }
-    df_all = []
-    for loc in clima:
+    # Cada row esperado: {name|comuna, hourly:{time, wind_speed_10m, precipitation, precipitation_probability}}
+    out = []
+    for loc in rows:
         comuna_src = loc.get("comuna") or loc.get("name")
-        if not comuna_src:
-            continue
-        comuna_norm = mapping.get(normalize_name(comuna_src), normalize_name(comuna_src))
-
-        h = loc.get("hourly", {})
+        h = loc.get("hourly") or {}
         times = h.get("time") or []
         ws = h.get("wind_speed_10m") or []
         pr_mm = h.get("precipitation") or []
         pr_p = h.get("precipitation_probability") or []
-
         n = min(len(times), len(ws), len(pr_mm), len(pr_p))
-        for i in range(n):
-            df_all.append({
-                "comuna_raw": comuna_src,
-                "comuna": comuna_norm,
-                "time_utc": times[i],
-                "wind_speed_10m": ws[i],
-                "precip_mm": pr_mm[i],
-                "precip_prob": pr_p[i],
+        out.append({
+            "comuna": comuna_src,
+            "time": times[:n],
+            "wind": ws[:n],
+            "rain_mm": pr_mm[:n],
+            "rain_prob": pr_p[:n],
+        })
+    return out
+
+
+def main():
+    # ----- Cargar insumos -----
+    baseline_by_dow_hour, global_mean = load_seed()
+    mapping_raw = load_json(COMUNAS_MAPPING_PATH, default={})
+    mapping = build_equivalences(mapping_raw)
+    sens_map = load_sensitivity()
+
+    # ----- Descargar clima -----
+    clima_rows = fetch_clima(CLIMA_URL)
+
+    # ----- Expandir a DataFrame -----
+    recs = []
+    for loc in clima_rows:
+        comuna_raw = loc.get("comuna")
+        if not comuna_raw:
+            continue
+        comuna_norm = normalize_name(comuna_raw)
+        comuna_norm = mapping.get(comuna_norm, comuna_norm)
+
+        times = loc["time"]
+        ws = loc["wind"]
+        rm = loc["rain_mm"]
+        rp = loc["rain_prob"]
+
+        for i in range(len(times)):
+            recs.append({
+                "comuna_raw": comuna_raw,
+                "comuna_norm": comuna_norm,
+                "time": times[i],
+                "wind_kmh": ws[i],
+                "precip_mm": rm[i],
+                "precip_prob": rp[i],
             })
 
-    if not df_all:
-        raise RuntimeError("No llegaron datos de clima o estructura inesperada.")
+    if not recs:
+        raise RuntimeError("Clima vacío o estructura inesperada.")
 
-    df = pd.DataFrame(df_all)
-    # parse fechas (son locales en tu worker → asumiremos ISO local o UTC; si vienen ISO-Z, pandas las capta)
-    df["dt"] = pd.to_datetime(df["time_utc"], errors="coerce")
+    df = pd.DataFrame(recs)
+    # Parse datetimes
+    df["dt"] = pd.to_datetime(df["time"], errors="coerce")
     df = df.dropna(subset=["dt"])
 
-    # Ventana: hoy (SCL) → +7 días
-    t0 = now_scl().replace(minute=0, second=0, microsecond=0)
+    # Ventana: hoy(SCL) → +7 días
+    t0 = (now_scl()).replace(minute=0, second=0, microsecond=0)
     tmax = t0 + dt.timedelta(days=7)
     df = df[(df["dt"] >= t0) & (df["dt"] <= tmax)].copy()
 
-    # Cálculo de severidades y expected
+    # Severidades y confianza
     df["rain_sev"] = df.apply(lambda r: severity_rain(r["precip_mm"], r["precip_prob"]), axis=1)
-    df["wind_sev"] = df["wind_speed_10m"].apply(severity_wind)
+    df["wind_sev"] = df["wind_kmh"].apply(severity_wind)
     df["sev"] = df.apply(lambda r: combine_severity(r["rain_sev"], r["wind_sev"]), axis=1)
-
-    # expected_calls desde semilla por hora/dow
-    df["expected_calls"] = df["dt"].apply(lambda d: expected_from_seed(seed, d))
-
-    # sensibilidad comuna
-    df["sens"] = df["comuna"].apply(sens_for)
-
-    # extra_calls continuo
-    df["extra_calls_cont"] = df["expected_calls"] * K_BASE * df["sens"] * df["sev"]
-
-    # Redondeo y filtros
-    df["extra_calls"] = np.rint(df["extra_calls_cont"]).astype(int)
-    df["total_calls"] = (df["expected_calls"] + df["extra_calls"]).astype(int)
-
-    # confidence
     df["confidence"] = df.apply(lambda r: confidence_from(r["rain_sev"], r["wind_sev"], r["precip_prob"]), axis=1)
 
-    # Tipo de evento “más dominante”
+    # Baseline esperado por hora
+    df["expected_calls"] = df["dt"].apply(lambda d: expected_from_seed(baseline_by_dow_hour, global_mean, d))
+
+    # Factor por clima (antes de sensibilidad): 1 + K_BASE * severidad
+    df["factor_model"] = 1.0 + (K_BASE * df["sev"]).clip(lower=0.0)
+
+    # Ajuste por sensibilidad por comuna + suavizado
+    df["factor_adj"] = df.apply(lambda r: adjust_factor(r["factor_model"], r["comuna_norm"], sens_map), axis=1)
+
+    # Adicionales y totales
+    df["extra_calls"] = np.rint(df["expected_calls"] * np.maximum(0.0, df["factor_adj"] - 1.0)).astype(int)
+    df["total_calls"] = (df["expected_calls"] + df["extra_calls"]).astype(int)
+
+    # Etiqueta evento dominante
     def classify_evt(row):
         if row["rain_sev"] >= 0.6 and row["wind_sev"] >= 0.6:
             return "lluvia+viento"
@@ -252,30 +279,36 @@ def main():
 
     df["evento"] = df.apply(classify_evt, axis=1)
 
-    # Filtro de ruido
+    # Filtros: ruido y confianza
     def pass_threshold(row):
-        min_rel = max(MIN_EXTRA_ABS, int(math.ceil(MIN_EXTRA_REL * row["expected_calls"])))
-        return (row["extra_calls"] >= min_rel) and (row["confidence"] >= CONFIDENCE_MIN)
+        if row["confidence"] < CONFIDENCE_MIN:
+            return False
+        if row["factor_adj"] < UMBRAL_FACTOR:
+            return False
+        min_abs = max(UMBRAL_MIN_CALLS, int(math.ceil(0.08 * row["expected_calls"])))
+        return row["extra_calls"] >= min_abs
 
     df = df[df.apply(pass_threshold, axis=1)].copy()
 
-    # Ordenar y seleccionar columnas finales
-    df = df.sort_values(["dt", "comuna"])
+    # Ordenar y preparar salida
+    df = df.sort_values(["dt", "comuna_norm"])
     out = []
     for _, r in df.iterrows():
         out.append({
             "fecha": r["dt"].strftime("%Y-%m-%d"),
             "hora": int(r["dt"].hour),
-            "comuna": r["comuna"],
+            "comuna": r["comuna_norm"],
             "evento": r["evento"],
-            "wind_speed_10m": float(round(r["wind_speed_10m"], 2)),
+            "wind_speed_10m": float(round(r["wind_kmh"], 2)),
             "precip_mm": float(round(r["precip_mm"], 2)),
             "precip_prob": int(round(r["precip_prob"])),
             "expected_calls": int(round(r["expected_calls"])),
             "extra_calls": int(round(r["extra_calls"])),
             "total_calls": int(round(r["total_calls"])),
             "severity": float(round(r["sev"], 3)),
-            "confidence": float(round(r["confidence"], 3))
+            "confidence": float(round(r["confidence"], 3)),
+            "factor_model": float(round(r["factor_model"], 3)),
+            "factor_ajustado": float(round(r["factor_adj"], 3))
         })
 
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
@@ -287,4 +320,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
