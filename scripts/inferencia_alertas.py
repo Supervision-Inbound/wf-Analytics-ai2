@@ -11,313 +11,352 @@ import numpy as np
 import pandas as pd
 import requests
 
-# === Zona horaria (robusto) ===
-try:
-    from zoneinfo import ZoneInfo  # Python 3.9+
-    TZ_SCL = ZoneInfo("America/Santiago")
-except Exception:
-    TZ_SCL = None  # fallback sin zoneinfo
-
 # =========================
-# CONFIG AJUSTABLE (por env o editando aquí)
+# CONFIG (ajustable por env)
 # =========================
-CLIMA_URL = os.getenv(
-    "CLIMA_URL",
-    "https://turnos-api-inbound.andres-eliecergonzalez.workers.dev/clima"
-)
+PRED_URL   = os.getenv("PRED_URL",   "https://turnos-api-inbound.andres-eliecergonzalez.workers.dev/predicciones")
+TURNOS_URL = os.getenv("TURNOS_URL", "https://turnos-api-inbound.andres-eliecergonzalez.workers.dev/turnos")
 
-# Salida
+# salida
 OUT_PATH = "public/alertas.json"
 
-# Insumos locales
-SEMILLA_PATH            = "data/semilla_llamadas.json"     # baseline por (dow-hora)
-COMUNAS_MAPPING_PATH    = "data/comunas_mapping.json"       # opcional (sinónimo → nombre oficial)
-SENSIBILIDAD_PATH       = "data/sensibilidad_comunas.json"  # opcional (ponderador por comuna)
+# ventana de exportación
+DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "7"))
+TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "3"))  # ~America/Santiago (aprox)
 
-# Parámetros de severidad y ponderación (realismo)
-RAIN_MM_MIN   = float(os.getenv("RAIN_MM_MIN", "5.0"))   # mm a partir de donde "pega"
-RAIN_MM_MAX   = float(os.getenv("RAIN_MM_MAX", "30.0"))  # mm donde severidad ≈ 1
-WIND_KMH_MIN  = float(os.getenv("WIND_KMH_MIN", "35.0")) # km/h a partir de donde "pega"
-WIND_KMH_MAX  = float(os.getenv("WIND_KMH_MAX", "60.0")) # km/h donde severidad ≈ 1
+# Erlang-C / dimensionamiento
+ASA_TARGET_SEC = float(os.getenv("ASA_TARGET_SEC", "22"))
+SL_TARGET      = float(os.getenv("SL_TARGET", "0.90"))   # 90%
+AHT_SEC        = float(os.getenv("AHT_SEC", "180"))      # fallback si no viene en predicción
+PRODUCTIVIDAD  = float(os.getenv("PRODUCTIVIDAD", "0.85"))  # 85% => agentes efectivos = planificados * 0.85
+INTERVAL_MIN   = int(os.getenv("INTERVAL_MIN", "60"))    # trabajamos por hora
 
-# Intensidad base del efecto meteo (fracción máx. sobre expected_calls)
-# factor_model = 1 + K_BASE * severidad (antes de sensibilidad/alpha)
-K_BASE = float(os.getenv("K_BASE", "0.30"))               # 30% de techo con severidad=1
-
-# Sensibilidad y filtros de alertas
-ALPHA_SUAVIZADO  = float(os.getenv("ALPHA_SUAVIZADO", "0.75"))
-UMBRAL_FACTOR    = float(os.getenv("UMBRAL_FACTOR", "1.10"))  # 10%+
-UMBRAL_MIN_CALLS = int(os.getenv("UMBRAL_MIN_CALLS", "8"))    # mín. llamadas extra
-CONFIDENCE_MIN   = float(os.getenv("CONFIDENCE_MIN", "0.35")) # descartar baja confianza
+# filtros de “alertas” (si quieres recortar ruido aquí)
+CONFIDENCE_MIN = float(os.getenv("CONFIDENCE_MIN", "0.35"))
+UMBRAL_FACTOR  = float(os.getenv("UMBRAL_FACTOR", "1.10"))
+UMBRAL_MIN_EXTRA = int(os.getenv("UMBRAL_MIN_EXTRA", "5"))
 
 # =========================
-# Utils
+# Utilidades de tiempo
 # =========================
-def load_json(path, default=None):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return default if default is not None else {}
-    except Exception:
-        return default if default is not None else {}
-
-def normalize_name(s: str) -> str:
-    if not s:
-        return s
-    s2 = str(s).strip().lower()
-    s2 = " ".join(s2.split())
-    return s2
-
-def build_equivalences(mapping: dict) -> dict:
-    eq = {}
-    for k, v in (mapping or {}).items():
-        eq[normalize_name(k)] = normalize_name(v)
-    return eq
-
 def now_scl():
-    # Si hay zoneinfo disponible, usamos SCL; si no, UTC “aproximado”
-    if TZ_SCL is not None:
-        return dt.datetime.now(tz=TZ_SCL)
-    return dt.datetime.utcnow()
+    # Runner en UTC; aproximamos SCL restando TZ_OFFSET_HOURS
+    return dt.datetime.utcnow() - dt.timedelta(hours=TZ_OFFSET_HOURS)
 
-# ---------- Baseline (semilla) ----------
-def load_seed():
-    """
-    Acepta estructuras:
-      1) {"baseline_by_dow_hour": {"0-0": x, "0-1": y, ...}, "global_mean": m}
-      2) {"weekday": {"0":[24],..., "6":[24]}, "global_mean": m}
-      3) {"hourly":[24], "weekday_boost":1.0, "weekend_boost":1.05}
-      4) Fallback: global_mean=100
-    """
-    seed = load_json(SEMILLA_PATH, default={})
-    # Normaliza a dict "baseline_by_dow_hour"
-    if "baseline_by_dow_hour" in seed and isinstance(seed["baseline_by_dow_hour"], dict):
-        base = {str(k): float(v) for k, v in seed["baseline_by_dow_hour"].items()}
-        gm = float(seed.get("global_mean", 100.0))
-        return base, gm
+def std_yyyy_mm_dd_h(dtobj: dt.datetime):
+    return dtobj.strftime("%Y-%m-%d"), dtobj.hour
 
-    if "weekday" in seed and isinstance(seed["weekday"], dict):
-        base = {}
-        for k, arr in seed["weekday"].items():
-            if isinstance(arr, list) and len(arr) == 24:
-                for h in range(24):
-                    base[f"{k}-{h}"] = float(arr[h])
-        gm = float(seed.get("global_mean", np.mean(list(base.values())) if base else 100.0))
-        return base, gm
-
-    if "hourly" in seed and isinstance(seed["hourly"], list) and len(seed["hourly"]) == 24:
-        wb = float(seed.get("weekday_boost", 1.0))
-        we = float(seed.get("weekend_boost", 1.0))
-        base = {}
-        for dow in range(7):
-            boost = we if dow >= 5 else wb
-            for h in range(24):
-                base[f"{dow}-{h}"] = float(seed["hourly"][h]) * boost
-        gm = float(seed.get("global_mean", np.mean(seed["hourly"])))
-        return base, gm
-
-    # Fallback llano
-    base = {f"{dow}-{h}": 100.0 for dow in range(7) for h in range(24)}
-    return base, 100.0
-
-def expected_from_seed(baseline_by_dow_hour: dict, global_mean: float, when: dt.datetime) -> float:
-    # when está en tz SCL; usamos weekday() y hour
-    key = f"{when.weekday()}-{when.hour}"
-    return float(baseline_by_dow_hour.get(key, global_mean))
-
-# ---------- Severidades y confianza ----------
-def severity_rain(precip_mm: float, precip_prob: float) -> float:
-    if precip_mm is None:
-        return 0.0
-    mm = max(0.0, (precip_mm - RAIN_MM_MIN)) / max(1e-6, (RAIN_MM_MAX - RAIN_MM_MIN))
-    mm = max(0.0, min(1.0, mm))
-    p = max(0.0, min(1.0, (precip_prob or 0.0) / 100.0))
-    return mm * p
-
-def severity_wind(wind_kmh: float) -> float:
-    if wind_kmh is None:
-        return 0.0
-    sev = (wind_kmh - WIND_KMH_MIN) / max(1e-6, (WIND_KMH_MAX - WIND_KMH_MIN))
-    return max(0.0, min(1.0, sev))
-
-def combine_severity(rain_sev: float, wind_sev: float) -> float:
-    return 1.0 - (1.0 - max(0, min(1, rain_sev))) * (1.0 - max(0, min(1, wind_sev)))
-
-def confidence_from(rain_sev: float, wind_sev: float, precip_prob: float) -> float:
-    p = max(0.0, min(1.0, (precip_prob or 0.0) / 100.0))
-    sev = combine_severity(rain_sev, wind_sev)
-    return 0.5 * sev + 0.5 * p
-
-# ---------- Sensibilidad ----------
-def load_sensitivity():
-    sens = load_json(SENSIBILIDAD_PATH, default={})
-    return {normalize_name(k): float(v) for k, v in sens.items()}
-
-def adjust_factor(factor_model: float, comuna_norm: str, sens_map: dict) -> float:
-    override = float(sens_map.get(comuna_norm, 1.0))
-    return (factor_model ** ALPHA_SUAVIZADO) * override
-
-# ---------- Fetch y parsing de clima ----------
-def fetch_clima(url: str):
+# =========================
+# Fetch & parsing de predicciones (alertas inteligentes)
+# =========================
+def fetch_predicciones(url: str):
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     data = r.json()
-    # Soportar dos formas:
-    # a) { ok: true, rows: [ {...}, {...} ] }
-    # b) [ {...}, {...} ]
-    if isinstance(data, dict) and "rows" in data:
-        rows = data["rows"]
-    elif isinstance(data, list):
-        rows = data
-    else:
-        raise RuntimeError("Estructura de clima no reconocida.")
+    # soporta lista o dict con 'rows'
+    rows = data.get("rows", data) if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        raise RuntimeError("Estructura de predicciones no reconocida")
+    return rows
+
+def filter_alertas_rows(rows):
+    """Filtra a hoy -> +7 días y conserva sólo filas con impacto razonable."""
+    t0 = now_scl().replace(minute=0, second=0, microsecond=0)
+    tmax = t0 + dt.timedelta(days=DAYS_AHEAD)
 
     out = []
-    for loc in rows:
-        comuna_src = loc.get("comuna") or loc.get("name")
-        h = loc.get("hourly") or {}
-        times = h.get("time") or []
-        ws = h.get("wind_speed_10m") or []
-        pr_mm = h.get("precipitation") or []
-        pr_p = h.get("precipitation_probability") or []
-        n = min(len(times), len(ws), len(pr_mm), len(pr_p))
+    for r in rows:
+        # tolera distintos nombres de campos
+        fecha = r.get("fecha") or r.get("fecha_dt") or r.get("date")
+        hora  = r.get("hora")  if "hora" in r else r.get("hour")
+        comuna = r.get("comuna") or r.get("name")
+
+        # parse fecha/hora
+        try:
+            h = int(hora)
+        except:
+            continue
+        try:
+            d = pd.to_datetime(fecha, errors="coerce")
+        except:
+            d = None
+        if d is None or pd.isna(d):
+            continue
+        when = dt.datetime(d.year, d.month, d.day, h)
+
+        if not (t0 <= when <= tmax):
+            continue
+
+        # campos core (con tolerancia a nombres)
+        expected = r.get("expected_calls") or r.get("pred_llamadas_base") or r.get("llamadas_base") or r.get("pred_llamadas")
+        total    = r.get("total_calls")    or r.get("pred_llamadas_ajustada") or r.get("llamadas_total") or r.get("pred")
+        extra    = r.get("extra_calls")
+        factor   = r.get("factor_ajustado") or r.get("factor") or (float(total)/float(expected) if expected and total else 1.0)
+        conf     = r.get("confidence") or r.get("confianza") or 0.5
+        evento   = r.get("evento") or r.get("tipo") or "ninguno"
+        wind     = r.get("wind_speed_10m") or r.get("viento") or None
+        rain_mm  = r.get("precip_mm") or r.get("lluvia_mm") or None
+        rain_p   = r.get("precip_prob") or r.get("prob_lluvia") or None
+
+        # si falta total/expected, intenta construirlos
+        if expected is None and total is not None:
+            expected = total / max(1e-9, factor)
+        if total is None and expected is not None:
+            total = expected * max(1.0, float(factor))
+
+        # filtrar ruido de alertas
+        if (float(conf) < CONFIDENCE_MIN) or (float(factor) < UMBRAL_FACTOR):
+            continue
+        if extra is None and expected is not None and total is not None:
+            cand_extra = int(round(float(total) - float(expected)))
+            if cand_extra < max(UMBRAL_MIN_EXTRA, int(math.ceil(0.08*float(expected)))):
+                continue
+        elif extra is not None and int(extra) < UMBRAL_MIN_EXTRA:
+            continue
+
         out.append({
-            "comuna": comuna_src,
-            "time": times[:n],
-            "wind": ws[:n],
-            "rain_mm": pr_mm[:n],
-            "rain_prob": pr_p[:n],
+            "fecha": when.strftime("%Y-%m-%d"),
+            "hora":  when.hour,
+            "comuna": comuna,
+            "evento": evento,
+            "wind_speed_10m": round(float(wind), 2) if wind is not None else None,
+            "precip_mm": round(float(rain_mm), 2) if rain_mm is not None else None,
+            "precip_prob": int(round(float(rain_p))) if rain_p is not None else None,
+            "expected_calls": int(round(float(expected))) if expected is not None else None,
+            "extra_calls":    int(round(float(extra)))    if extra is not None else int(round(float(total) - float(expected))) if (expected is not None and total is not None) else None,
+            "total_calls":    int(round(float(total)))    if total is not None else None,
+            "factor_ajustado": round(float(factor), 3) if factor is not None else None,
+            "confidence": round(float(conf), 3)
         })
+    return out
+
+# =========================
+# Erlang-C helpers
+# =========================
+def erlang_c_probability(A, N):
+    """
+    Probabilidad de espera (cola) con carga A (erlangs) y N agentes.
+    Fórmula clásica de Erlang C.
+    """
+    if N <= 0 or A <= 0:
+        return 1.0
+    if A >= N:  # sistema inestable => prob cola  ~1
+        return 1.0
+    # sumar términos 0..N-1
+    sum_terms = 0.0
+    term = 1.0
+    for k in range(1, N):
+        term *= A / k
+        sum_terms += term
+    # término de estado saturado
+    termN = term * (A / N)
+    p0 = 1.0 / (1.0 + sum_terms + termN * (1.0 / (1.0 - A / N)))
+    pw = termN * p0 * (1.0 / (1.0 - A / N))
+    return pw
+
+def service_level(A, N, asa_sec):
+    """
+    NS = 1 - P(espera > asa) = 1 - ErlangC*exp(-(N-A)*asa/AHT)
+    con tasa servicio = 1/AHT (A = lambda * AHT)
+    """
+    if N <= 0 or A <= 0:
+        return 0.0
+    if A >= N:
+        return 0.0
+    pw = erlang_c_probability(A, N)
+    mu = 1.0  # trabajaremos con A ya como erlangs (= lambda*AHT). Por eso mu=1 y asa multiplica (N-A)
+    # En la forma normalizada, la “tasa de salida” efectiva para espera es (N - A) * mu / A
+    # como A = λ * AHT, y mu = 1/AHT, se simplifica a exp(-(N-A)*asa/A)
+    return 1.0 - pw * math.exp(-(N - A) * (asa_sec / AHT_SEC) * (AHT_SEC / A))  # se simplifica a exp(-(N-A)*asa/A)
+
+def required_agents_by_erlang(lambda_calls, aht_sec, asa_target, sl_target):
+    """
+    Dado λ (llamadas/seg) y AHT (seg), carga A=λ*AHT. Subimos N hasta cumplir NS>=sl_target.
+    """
+    if lambda_calls <= 0:
+        return 0
+    A = lambda_calls * aht_sec
+    N = max(1, int(math.ceil(A)))  # mínimo estable
+    # búsqueda incremental
+    for n in range(N, N + 1000):
+        ns = service_level(A, n, asa_target)
+        if ns >= sl_target:
+            return n
+    return N + 1000  # fallback teórico
+
+# =========================
+# Turnos → agentes planificados por hora
+# =========================
+def excel_serial_to_date(serial):
+    # Excel date (base 1899-12-30); la API ya normaliza, pero por si acaso
+    if not isinstance(serial, (int, float)) or serial <= 0:
+        return None
+    return dt.datetime(1899, 12, 30) + dt.timedelta(days=float(serial))
+
+def excel_fraction_to_time(frac):
+    # Fracción de día → (h, m)
+    if not isinstance(frac, (int, float)) or frac < 0:
+        return None
+    total_min = round(float(frac) * 24 * 60)
+    h = (total_min // 60) % 24
+    m = total_min % 60
+    return h, m
+
+def parse_turnos(raw):
+    """
+    Acepta lista o dict con 'value'. Espera columnas tipo Excel:
+      Fecha (serial), Ini (fracción), Fin (fracción) o equivalentes.
+    Devuelve lista de turnos con inicio/fin datetime.
+    """
+    data = raw if isinstance(raw, list) else raw.get("value", [])
+    out = []
+    for row in data:
+        fecha = row.get("Fecha") or row.get("fecha") or row.get("Date")
+        ini   = row.get("Ini")   or row.get("ini")   or row.get("INICIO")
+        fin   = row.get("FIN")   or row.get("Fin")   or row.get("fin")
+        d = excel_serial_to_date(fecha) if isinstance(fecha, (int, float)) else None
+        if d is None:
+            continue
+        s_hm = excel_fraction_to_time(ini) if ini is not None else None
+        e_hm = excel_fraction_to_time(fin) if fin is not None else None
+        if not s_hm or not e_hm:
+            continue
+        start = d.replace(hour=s_hm[0], minute=s_hm[1], second=0, microsecond=0)
+        end   = d.replace(hour=e_hm[0], minute=e_hm[1], second=0, microsecond=0)
+        if end <= start:
+            end += dt.timedelta(days=1)  # turno cruzando medianoche
+        out.append({"ini": start, "fin": end})
+    return out
+
+def hourly_staff_from_shifts(turnos, t0, tmax):
+    """
+    Cuenta agentes planificados por cada hora entre [t0, tmax].
+    Un turno contribuye a cada hora en la que está activo (intersección > 0 min).
+    """
+    buckets = defaultdict(int)
+    cur = t0
+    while cur <= tmax:
+        buckets[cur] = 0
+        cur += dt.timedelta(hours=1)
+    for sh in turnos:
+        ini, fin = sh["ini"], sh["fin"]
+        # recorta a ventana
+        s = max(ini, t0)
+        e = min(fin, tmax + dt.timedelta(hours=1))
+        if e <= s:
+            continue
+        # marcar horas tocadas
+        h = dt.datetime(s.year, s.month, s.day, s.hour)
+        while h < e:
+            # si hay solapamiento con la hora [h, h+1)
+            ovl = max(0, (min(e, h + dt.timedelta(hours=1)) - max(s, h)).total_seconds())
+            if ovl > 0:
+                buckets[h] += 1
+            h += dt.timedelta(hours=1)
+    # a lista ordenada
+    out = []
+    for when in sorted(buckets.keys()):
+        out.append({"when": when, "agents_planned": buckets[when]})
     return out
 
 # =========================
 # Main
 # =========================
 def main():
-    # ----- Cargar insumos -----
-    baseline_by_dow_hour, global_mean = load_seed()
-    mapping_raw = load_json(COMUNAS_MAPPING_PATH, default={})
-    mapping = build_equivalences(mapping_raw)
-    sens_map = load_sensitivity()
+    # 1) Predicciones (alertas inteligentes)
+    pred_rows = fetch_predicciones(PRED_URL)
+    alertas = filter_alertas_rows(pred_rows)
 
-    # ----- Descargar clima -----
-    clima_rows = fetch_clima(CLIMA_URL)
+    # 2) Forecast por hora (sumamos total_calls por fecha-hora en todas las comunas)
+    t0 = now_scl().replace(minute=0, second=0, microsecond=0)
+    tmax = t0 + dt.timedelta(days=DAYS_AHEAD)
 
-    # ----- Expandir a DataFrame -----
-    recs = []
-    for loc in clima_rows:
-        comuna_raw = loc.get("comuna")
-        if not comuna_raw:
-            continue
-        comuna_norm = normalize_name(comuna_raw)
-        comuna_norm = mapping.get(comuna_norm, comuna_norm)
+    # intentamos usar AHT si viene en las filas; si no, usamos AHT_SEC global
+    df_alert = pd.DataFrame(alertas)
+    if df_alert.empty:
+        df_alert = pd.DataFrame(columns=["fecha", "hora", "total_calls"])
 
-        times = loc["time"]
-        ws = loc["wind"]
-        rm = loc["rain_mm"]
-        rp = loc["rain_prob"]
+    df_alert["dt"] = pd.to_datetime(df_alert["fecha"]) + pd.to_timedelta(df_alert["hora"], unit="h")
+    df_alert = df_alert[(df_alert["dt"] >= t0) & (df_alert["dt"] <= tmax)].copy()
 
-        for i in range(len(times)):
-            recs.append({
-                "comuna_raw": comuna_raw,
-                "comuna_norm": comuna_norm,
-                "time": times[i],
-                "wind_kmh": ws[i],
-                "precip_mm": rm[i],
-                "precip_prob": rp[i],
-            })
-
-    if not recs:
-        raise RuntimeError("Clima vacío o estructura inesperada.")
-
-    df = pd.DataFrame(recs)
-
-    # ======= PARSE DATETIME ROBUSTO (arreglo) =======
-    # 1) parsear siempre en UTC (naive → UTC; aware → convertido a UTC)
-    ts_utc = pd.to_datetime(df["time"], errors="coerce", utc=True)
-    # 2) convertir a America/Santiago si es posible
-    if TZ_SCL is not None:
-        df["dt"] = ts_utc.dt.tz_convert(TZ_SCL)
+    # total de llamadas por hora (todas las comunas)
+    calls_by_hour = (
+        df_alert.groupby("dt", as_index=False)["total_calls"]
+        .sum()
+        .rename(columns={"total_calls": "calls"})
+    )
+    # AHT por hora (si alguna fila lo trae; si no, global)
+    if "pred_tmo_min" in df_alert.columns:
+        # pred_tmo_min viene en minutos → a segundos (promedio por hora)
+        aht_by_hour = (
+            df_alert.groupby("dt", as_index=False)["pred_tmo_min"]
+            .mean()
+            .assign(aht_sec=lambda d: d["pred_tmo_min"] * 60.0)[["dt", "aht_sec"]]
+        )
     else:
-        # fallback sin zoneinfo (mantener en UTC)
-        df["dt"] = ts_utc
-    # ================================================
+        aht_by_hour = pd.DataFrame({"dt": calls_by_hour["dt"], "aht_sec": AHT_SEC})
 
-    df = df.dropna(subset=["dt"])
+    demand = calls_by_hour.merge(aht_by_hour, on="dt", how="left")
+    demand["aht_sec"] = demand["aht_sec"].fillna(AHT_SEC)
 
-    # Ventana: hoy(SCL) → +7 días (incluye hora actual redondeada)
-    now = now_scl().replace(minute=0, second=0, microsecond=0)
-    tmax = now + dt.timedelta(days=7)
-    df = df[(df["dt"] >= now) & (df["dt"] <= tmax)].copy()
+    # 3) Requeridos por Erlang C
+    req_records = []
+    for _, row in demand.iterrows():
+        when = row["dt"].to_pydatetime()
+        calls = float(row["calls"] or 0.0)
+        aht   = float(row["aht_sec"] or AHT_SEC)
 
-    # Severidades y confianza
-    df["rain_sev"] = df.apply(lambda r: severity_rain(r["precip_mm"], r["precip_prob"]), axis=1)
-    df["wind_sev"] = df["wind_kmh"].apply(severity_wind)
-    df["sev"] = df.apply(lambda r: combine_severity(r["rain_sev"], r["wind_sev"]), axis=1)
-    df["confidence"] = df.apply(lambda r: confidence_from(r["rain_sev"], r["wind_sev"], r["precip_prob"]), axis=1)
+        # tasa λ (llamadas/seg) en el intervalo de 1 hora
+        lam = calls / (INTERVAL_MIN * 60.0)
+        n_req = required_agents_by_erlang(lam, aht, ASA_TARGET_SEC, SL_TARGET)
+        req_records.append({"when": when, "calls": int(round(calls)), "aht_sec": aht, "agents_required": int(n_req)})
 
-    # Baseline esperado por hora (según dow-hora SCL)
-    df["expected_calls"] = df["dt"].apply(lambda d: expected_from_seed(baseline_by_dow_hour, global_mean, d))
+    df_req = pd.DataFrame(req_records) if req_records else pd.DataFrame(columns=["when","calls","aht_sec","agents_required"])
 
-    # Factor por clima (antes de sensibilidad): 1 + K_BASE * severidad
-    df["factor_model"] = 1.0 + (K_BASE * df["sev"]).clip(lower=0.0)
+    # 4) Turnos → agentes planificados
+    try:
+        tr = requests.get(TURNOS_URL, timeout=60); tr.raise_for_status()
+        turnos_raw = tr.json()
+        shifts = parse_turnos(turnos_raw)
+    except Exception as e:
+        shifts = []
 
-    # Ajuste por sensibilidad por comuna + suavizado
-    df["factor_adj"] = df.apply(lambda r: adjust_factor(r["factor_model"], r["comuna_norm"], sens_map), axis=1)
+    staff = hourly_staff_from_shifts(shifts, t0, tmax) if shifts else [{"when": w, "agents_planned": 0} for w in pd.date_range(t0, tmax, freq="1H")]
 
-    # Adicionales y totales
-    df["extra_calls"] = np.rint(df["expected_calls"] * np.maximum(0.0, df["factor_adj"] - 1.0)).astype(int)
-    df["total_calls"] = (df["expected_calls"] + df["extra_calls"]).astype(int)
+    df_staff = pd.DataFrame(staff)
+    df = df_req.merge(df_staff, on="when", how="left").fillna({"agents_planned": 0})
 
-    # Etiqueta evento dominante
-    def classify_evt(row):
-        if row["rain_sev"] >= 0.6 and row["wind_sev"] >= 0.6:
-            return "lluvia+viento"
-        if row["rain_sev"] >= row["wind_sev"]:
-            return "lluvia" if row["rain_sev"] > 0 else "ninguno"
-        return "viento" if row["wind_sev"] > 0 else "ninguno"
+    # productividad: dotación efectiva
+    df["agents_planned_eff"] = (df["agents_planned"] * PRODUCTIVIDAD).round(2)
+    df["deficit"] = (df["agents_required"] - df["agents_planned_eff"]).round(2)
 
-    df["evento"] = df.apply(classify_evt, axis=1)
-
-    # Filtros: ruido y confianza
-    def pass_threshold(row):
-        if row["confidence"] < CONFIDENCE_MIN:
-            return False
-        if row["factor_adj"] < UMBRAL_FACTOR:
-            return False
-        # requerir también un mínimo absoluto relativo a la base
-        min_abs = max(UMBRAL_MIN_CALLS, int(math.ceil(0.08 * row["expected_calls"])))
-        return row["extra_calls"] >= min_abs
-
-    df = df[df.apply(pass_threshold, axis=1)].copy()
-
-    # Ordenar y preparar salida
-    df = df.sort_values(["dt", "comuna_norm"])
-    out = []
-    for _, r in df.iterrows():
-        out.append({
-            "fecha": r["dt"].strftime("%Y-%m-%d"),
-            "hora": int(r["dt"].hour),
-            "comuna": r["comuna_norm"],
-            "evento": r["evento"],
-            "wind_speed_10m": float(round(r["wind_kmh"], 2)),
-            "precip_mm": float(round(r["precip_mm"], 2)),
-            "precip_prob": int(round(r["precip_prob"])),
-            "expected_calls": int(round(r["expected_calls"])),
-            "extra_calls": int(round(r["extra_calls"])),
-            "total_calls": int(round(r["total_calls"])),
-            "severity": float(round(r["sev"], 3)),
-            "confidence": float(round(r["confidence"], 3)),
-            "factor_model": float(round(r["factor_model"], 3)),
-            "factor_ajustado": float(round(r["factor_adj"], 3))
+    # 5) Salida “staffing_deficit”
+    staffing_deficit = []
+    for _, r in df.sort_values("when").iterrows():
+        fecha, hora = std_yyyy_mm_dd_h(r["when"])
+        staffing_deficit.append({
+            "fecha": fecha,
+            "hora": int(hora),
+            "calls": int(r["calls"]),
+            "aht_sec": round(float(r["aht_sec"]), 2),
+            "asa_target_sec": ASA_TARGET_SEC,
+            "sl_target": SL_TARGET,
+            "agents_required": int(r["agents_required"]),
+            "agents_planned": int(r["agents_planned"]),
+            "agents_planned_eff": float(r["agents_planned_eff"]),
+            "deficit": float(r["deficit"])  # >0 => faltan agentes
         })
 
+    # 6) Escribir JSON consolidado
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     with open(OUT_PATH, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
+        json.dump({
+            "alertas": alertas,
+            "staffing_deficit": staffing_deficit
+        }, f, ensure_ascii=False, indent=2)
 
-    print(f"✅ alertas guardadas en {OUT_PATH} — filas: {len(out)}")
+    print(f"✅ Generado {OUT_PATH} | alertas={len(alertas)} | filas staffing={len(staffing_deficit)}")
 
 if __name__ == "__main__":
     main()
+
