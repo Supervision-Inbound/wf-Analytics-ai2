@@ -2,8 +2,8 @@ name: generar-alertas
 
 on:
   workflow_dispatch:
-  # 03:00 America/Santiago ≈ 06:00 UTC (ajusta si cambia DST)
   schedule:
+    # 06:00 UTC ~ 03:00 Chile (ajusta si DST cambia)
     - cron: '0 6 * * *'
 
 permissions:
@@ -26,21 +26,28 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          key: ${{ runner.os }}-pip-alertas
+          restore-keys: ${{ runner.os }}-pip-
 
-      - name: Ensure libgomp
-        run: sudo apt-get update && sudo apt-get install -y libgomp1
-
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas numpy requests
 
-      - name: Run inference to generate alertas.json
+      - name: Run inference to generate public/alertas.json
         env:
-          CLIMA_URL: "https://turnos-api-inbound.andres-eliecergonzalez.workers.dev/clima"
+          PRED_URL: "https://turnos-api-inbound.andres-eliecergonzalez.workers.dev/predicciones"
+          TURNOS_URL: "https://turnos-api-inbound.andres-eliecergonzalez.workers.dev/turnos"
+          DAYS_AHEAD: "7"
+          TZ_OFFSET_HOURS: "3"
+          ASA_TARGET_SEC: "22"
+          SL_TARGET: "0.90"
+          AHT_SEC: "180"
+          PRODUCTIVIDAD: "0.85"
+          INTERVAL_MIN: "60"
+          CONFIDENCE_MIN: "0.35"
+          UMBRAL_FACTOR: "1.10"
+          UMBRAL_MIN_EXTRA: "5"
         run: |
           python scripts/inferencia_alertas.py
 
