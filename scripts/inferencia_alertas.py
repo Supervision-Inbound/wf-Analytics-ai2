@@ -1,7 +1,7 @@
 import json
 import math
 import os
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -17,17 +17,16 @@ SEED_PATH   = os.getenv("SEED_PATH", "data/semilla_llamadas.json")
 # Horizonte máximo (días) hacia adelante para exportar alertas
 MAX_DAYS_AHEAD = 7
 
+SCL = ZoneInfo("America/Santiago")
+
 # =========================
 # Utilidades
 # =========================
-SCL = ZoneInfo("America/Santiago")
-
 def norm(txt: str) -> str:
     """Normaliza nombres de comuna para aumentar el match."""
     if not isinstance(txt, str):
         return ""
     t = unidecode(txt).lower().strip()
-    # normalizaciones manuales comunes
     t = (
         t.replace("pto.", "puerto")
          .replace("pto ", "puerto ")
@@ -35,13 +34,76 @@ def norm(txt: str) -> str:
     )
     return t
 
+def _seed_to_dict(raw) -> dict:
+    """
+    Convierte distintos formatos de semilla a:
+    {
+      'comunas': [{'name':'...', '_norm':'...'}, ...],
+      'umbral_lluvia_mm': float|None,
+      'umbral_viento_kmh': float|None,
+      'umbral_prob_lluvia_pct': float|None
+    }
+    """
+    out = {
+        "comunas": [],
+        "umbral_lluvia_mm": None,
+        "umbral_viento_kmh": None,
+        "umbral_prob_lluvia_pct": None,
+    }
+
+    # Caso 1: objeto con comunas + umbrales
+    if isinstance(raw, dict):
+        # comunas puede venir como lista de strings u objetos
+        comunas = raw.get("comunas", [])
+        if isinstance(comunas, list):
+            for c in comunas:
+                if isinstance(c, str):
+                    out["comunas"].append({"name": c})
+                elif isinstance(c, dict):
+                    name = c.get("name") or c.get("comuna") or ""
+                    if name:
+                        out["comunas"].append({"name": name})
+        # umbrales si existen
+        for k in ["umbral_lluvia_mm", "umbral_viento_kmh", "umbral_prob_lluvia_pct"]:
+            if k in raw:
+                try:
+                    out[k] = float(raw[k])
+                except Exception:
+                    pass
+        return out
+
+    # Caso 2: lista
+    if isinstance(raw, list):
+        # puede ser lista de strings o de objetos con 'name'
+        for c in raw:
+            if isinstance(c, str):
+                out["comunas"].append({"name": c})
+            elif isinstance(c, dict):
+                name = c.get("name") or c.get("comuna") or ""
+                if name:
+                    out["comunas"].append({"name": name})
+        return out
+
+    # desconocido
+    return out
+
 def load_seed(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
-        seed = json.load(f)
-    # seed: { "comunas": [{"name": "...", ...}, ...], "umbral_lluvia_mm": 5, ... }
-    # Forzamos normalización de nombres semilla
+        raw = json.load(f)
+    seed = _seed_to_dict(raw)
+
+    # Normaliza nombres
     for c in seed.get("comunas", []):
         c["_norm"] = norm(c.get("name", ""))
+
+    # Umbrales por defecto si faltan
+    if seed.get("umbral_lluvia_mm") is None:
+        seed["umbral_lluvia_mm"] = 5.0
+    if seed.get("umbral_viento_kmh") is None:
+        seed["umbral_viento_kmh"] = 35.0
+    if seed.get("umbral_prob_lluvia_pct") is None:
+        seed["umbral_prob_lluvia_pct"] = 60.0
+
     return seed
 
 def fetch_clima(url: str) -> dict:
@@ -50,9 +112,7 @@ def fetch_clima(url: str) -> dict:
     return r.json()
 
 def iter_hours_from_row(row: dict):
-    """Itera horas del registro climático del Worker (/clima).
-       row['hourly'] contiene arrays paralelos: time[], precipitation[], precipitation_probability[], wind_speed_10m[]
-    """
+    """Itera horas del registro climático del Worker (/clima)."""
     h = row.get("hourly", {}) or {}
     times = h.get("time", []) or []
     wind  = h.get("wind_speed_10m", []) or []
@@ -63,15 +123,10 @@ def iter_hours_from_row(row: dict):
         yield times[i], float(wind[i]), float(rain[i]), float(ppop[i])
 
 def parse_iso_local_to_scl(ts: str) -> datetime:
-    # El Worker retorna times locales (timezone=auto). Parseamos y “decimos” que ya están en SCL.
-    # Si vinieran con Z/offset, se podría usar fromisoformat y astimezone(SCL).
     try:
-        # Maneja "YYYY-MM-DDTHH:MM" o con segundos
         dt = datetime.fromisoformat(ts.replace("Z",""))
     except Exception:
-        # fallback muy defensivo
         dt = datetime.strptime(ts[:16], "%Y-%m-%dT%H:%M")
-    # asumimos hora local de Chile
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=SCL)
     else:
@@ -79,9 +134,7 @@ def parse_iso_local_to_scl(ts: str) -> datetime:
     return dt
 
 # =========================
-# Inferencia muy simple de alertas
-#   - Usa umbrales de la semilla (lluvia/viento/prob lluvia)
-#   - Estima llamadas extra como factor simple (ejemplo)
+# Inferencia simple de alertas
 # =========================
 def main():
     if not CLIMA_URL:
@@ -90,12 +143,10 @@ def main():
     seed = load_seed(SEED_PATH)
     data = fetch_clima(CLIMA_URL)
 
-    # Umbrales desde semilla (con valores por defecto razonables)
     U_LLUVIA = float(seed.get("umbral_lluvia_mm", 5.0))
     U_VIENTO = float(seed.get("umbral_viento_kmh", 35.0))
     U_PPOP   = float(seed.get("umbral_prob_lluvia_pct", 60.0))
 
-    # Comunas “conocidas” por el modelo/semilla (para matchear rápido)
     comunas_seed = seed.get("comunas", [])
     comunas_seed_map = {c["_norm"]: c.get("name") for c in comunas_seed}
 
@@ -103,26 +154,20 @@ def main():
     now_scl = datetime.now(SCL)
     limit_dt = now_scl + timedelta(days=MAX_DAYS_AHEAD)
 
-    # El Worker devuelve un objeto con 'rows': lista de comunas agregadas por país.
     rows = data.get("rows", []) if isinstance(data, dict) else []
     for r in rows:
         comuna_name = r.get("name", "")
         comuna_norm = norm(comuna_name)
 
-        # Si no está en la semilla, igual podemos considerarla; opcionalmente la ignoras:
-        # if comuna_norm not in comunas_seed_map: continue
-
         for ts, wind, rain, ppop in iter_hours_from_row(r):
             dt = parse_iso_local_to_scl(ts)
 
-            # ====== FILTRO FECHA/HORA: solo desde AHORA en Santiago ======
+            # Solo desde AHORA en Santiago
             if dt < now_scl:
                 continue
-            # ====== Limitar horizonte ======
             if dt > limit_dt:
                 continue
 
-            # Señales de mal clima
             lluvia_fuerte = rain >= U_LLUVIA
             viento_fuerte = wind >= U_VIENTO
             prob_lluvia   = ppop >= U_PPOP
@@ -130,8 +175,6 @@ def main():
             if not (lluvia_fuerte or viento_fuerte or prob_lluvia):
                 continue
 
-            # Estimación “dummy” de llamadas extra (ajusta si quieres)
-            # Podrías usar factores de semilla por comuna o algo más afinado.
             extra = 0
             if lluvia_fuerte:
                 extra += 10 + 2 * max(0, rain - U_LLUVIA)
@@ -143,7 +186,7 @@ def main():
             alerts.append({
                 "fecha": dt.date().isoformat(),
                 "hora": dt.hour,
-                "comuna": comuna_seed_map.get(comuna_norm, comuna_name),  # nombre “bonito” si está en semilla
+                "comuna": comunas_seed_map.get(comuna_norm, comuna_name),
                 "clima": {
                     "lluvia_mm": round(rain, 2),
                     "viento_km_h": round(wind, 1),
@@ -157,7 +200,6 @@ def main():
                 "llamadas_extra_est": int(max(0, round(extra)))
             })
 
-    # Ordenar y volcar
     alerts.sort(key=lambda a: (a["fecha"], a["hora"], a["comuna"]))
 
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
