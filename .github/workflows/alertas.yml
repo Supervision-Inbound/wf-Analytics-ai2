@@ -2,7 +2,7 @@ name: generar-alertas
 
 on:
   workflow_dispatch:
-  # 03:00 America/Santiago ≈ 06:00 UTC (ajusta si cambia el horario de verano)
+  # 03:00 America/Santiago ≈ 06:00 UTC (ajusta si cambia el DST)
   schedule:
     - cron: '0 6 * * *'
 
@@ -34,21 +34,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # para garantizar base de datos IANA de zoneinfo
+          pip install tzdata
 
       - name: Run inference to generate alertas.json
         env:
           CLIMA_URL: "https://turnos-api-inbound.andres-eliecergonzalez.workers.dev/clima"
-          # Parámetros finos (opcionalmente ajustables desde aquí):
-          RAIN_MM_MIN: "5.0"
+
+          # ------- parámetros estricto/realista -------
+          RAIN_MM_MIN: "3.0"
           RAIN_MM_MAX: "30.0"
-          WIND_KMH_MIN: "35.0"
+          WIND_KMH_MIN: "45.0"
           WIND_KMH_MAX: "60.0"
-          K_BASE: "0.30"
-          ALPHA_SUAVIZADO: "0.75"
-          UMBRAL_FACTOR: "1.10"
-          UMBRAL_MIN_CALLS: "8"
-          CONFIDENCE_MIN: "0.35"
-          TZ_OFFSET_HOURS: "3"
+          K_BASE: "0.25"
+          ALPHA_SUAVIZADO: "0.70"
+          UMBRAL_FACTOR: "1.15"
+          UMBRAL_MIN_CALLS: "15"
+          CONFIDENCE_MIN: "0.55"
         run: |
           python scripts/inferencia_alertas.py
 
