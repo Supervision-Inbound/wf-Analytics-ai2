@@ -1,3 +1,16 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import json
+import math
+import datetime as dt
+
+import numpy as np
+import pandas as pd
+import requests
+from joblib import load
+
 name: generar-alertas
 
 on:
